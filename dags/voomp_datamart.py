@@ -10,8 +10,8 @@ Dois ramos independentes correm em paralelo:
                o xlsx de origem no bronze.
   - Projeções: espera arquivo -> bronze->silver -> silver->gold.
 
-Disparo event-driven: WasbPrefixSensor aguarda arquivos chegarem no bronze.
-Para testes locais puramente manuais, pode-se trocar `schedule` por None.
+Agendamento: Seg-Sex ao meio-dia (BRT), alinhado à janela de hibernação do
+Deployment. O WasbPrefixSensor faz uma checagem rápida do arquivo no bronze.
 
 Execução: as tasks rodam como pods no cluster (KubernetesExecutor) — o
 `executor_config` abaixo dimensiona memória/CPU por task. Esse config é
@@ -92,9 +92,9 @@ def voomp_task(task_id: str, script_relpath: str, executor_config=None, **kwargs
 with DAG(
     dag_id="voomp_datamart",
     description="Data mart Voomp: bronze -> silver -> gold (Azure Blob + Polars)",
-    # Arquivo chega 1x/dia em horário variável: roda 1x/dia (meia-noite BRT) e o
-    # sensor (deferrable, barato) espera o arquivo aparecer ao longo do dia.
-    schedule="@daily",
+    # Roda Seg-Sex ao meio-dia (BRT), alinhado à janela acordada do Deployment
+    # (hibernação): o arquivo já chegou (1x/dia), o sensor confere e processa.
+    schedule="0 12 * * 1-5",
     start_date=pendulum.datetime(2026, 1, 1, tz="America/Sao_Paulo"),
     catchup=False,
     max_active_runs=1,  # tasks movem/deletam blobs: 2 runs simultâneos corromperiam o estado
@@ -111,8 +111,8 @@ with DAG(
         prefix="source_voomp/voomp/",
         wasb_conn_id="wasb_default",
         deferrable=True,
-        poke_interval=600,
-        timeout=60 * 60 * 23,
+        poke_interval=120,
+        timeout=60 * 30,
         soft_fail=True,  # sem arquivo na janela -> pula o ramo (não falha o run)
     )
 
@@ -122,8 +122,8 @@ with DAG(
         prefix="source_voomp/projetadas_voomp/",
         wasb_conn_id="wasb_default",
         deferrable=True,
-        poke_interval=600,
-        timeout=60 * 60 * 23,
+        poke_interval=120,
+        timeout=60 * 30,
         soft_fail=True,  # projeção é opcional -> ausência pula o ramo
     )
 
