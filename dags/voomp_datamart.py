@@ -13,9 +13,9 @@ Dois ramos independentes correm em paralelo:
 Agendamento: Seg-Sex ao meio-dia (BRT), alinhado à janela de hibernação do
 Deployment. O WasbPrefixSensor faz uma checagem rápida do arquivo no bronze.
 
-Execução: as tasks rodam como pods no cluster (KubernetesExecutor) — o
-`executor_config` abaixo dimensiona memória/CPU por task. Esse config é
-ignorado pelo LocalExecutor (usado por `astro dev start`), sem efeito colateral.
+Execução: Deployment com CeleryExecutor (Development + hibernação). O
+`executor_config` de pods abaixo só age sob KubernetesExecutor — é ignorado
+sem efeito pelo Celery/LocalExecutor, então fica pronto caso troque depois.
 """
 from __future__ import annotations
 
@@ -27,8 +27,8 @@ from pathlib import Path
 import pendulum
 
 from airflow.models.dag import DAG
-from airflow.operators.empty import EmptyOperator
-from airflow.operators.python import PythonOperator
+from airflow.providers.standard.operators.empty import EmptyOperator
+from airflow.providers.standard.operators.python import PythonOperator
 from airflow.providers.microsoft.azure.sensors.wasb import WasbPrefixSensor
 from airflow.utils.trigger_rule import TriggerRule
 from kubernetes.client import models as k8s
@@ -103,14 +103,14 @@ with DAG(
 ) as dag:
 
     # --- Sensores de entrada (event-driven) ------------------------------ #
-    # deferrable=True: aguarda no triggerer (sem pod por poke). Requer provider
-    # Azure recente. Se a versão não suportar, troque por mode="reschedule".
+    # mode="reschedule": libera o worker entre os pokes; o soft_fail é respeitado
+    # no timeout (no Airflow 3 o soft_fail não funciona com deferrable=True).
     wait_voomp_files = WasbPrefixSensor(
         task_id="wait_voomp_files",
         container_name=BRONZE_CONTAINER,
         prefix="source_voomp/voomp/",
         wasb_conn_id="wasb_default",
-        deferrable=True,
+        mode="reschedule",
         poke_interval=120,
         timeout=60 * 30,
         soft_fail=True,  # sem arquivo na janela -> pula o ramo (não falha o run)
@@ -121,7 +121,7 @@ with DAG(
         container_name=BRONZE_CONTAINER,
         prefix="source_voomp/projetadas_voomp/",
         wasb_conn_id="wasb_default",
-        deferrable=True,
+        mode="reschedule",
         poke_interval=120,
         timeout=60 * 30,
         soft_fail=True,  # projeção é opcional -> ausência pula o ramo
