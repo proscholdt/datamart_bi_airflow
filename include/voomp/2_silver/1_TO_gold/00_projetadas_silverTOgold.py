@@ -28,8 +28,11 @@ pasta_origem = 'source_voomp/projetadas_voomp'
 pasta_destino = 'source_voomp/projetadas_voomp'
 nome_arquivo = "projetadasvoomp.parquet"
 
-# caminho do arquivo dentro do container Silver
-blob_caminho = f"{pasta_origem}/{nome_arquivo}"
+# Usar o arquivo de projetadas realmente encontrado na Silver (o nome pode variar)
+candidatos = [b for b in matching_blobs if b.startswith(pasta_origem + '/')]
+if not candidatos:
+    raise Exception(f"❌ Nenhum parquet de projetadas encontrado em {pasta_origem}/")
+blob_caminho = candidatos[0]
 
 print(f"\n🔍 Iniciando processamento do blob: {blob_caminho}")
 
