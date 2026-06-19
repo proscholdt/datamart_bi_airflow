@@ -31,7 +31,7 @@ cluster** (`KubernetesExecutor`).
 - **Disparo event-driven:** `WasbPrefixSensor` aguarda arquivos chegarem no bronze
   (`source_voomp/voomp/` e `source_voomp/projetadas_voomp/`).
 - **Paralelismo:** após o `bronze→silver`, as 4 dimensões + `f_vendas` rodam em paralelo;
-  o ramo de projetadas roda em paralelo ao de vendas.
+  o ramo de projeções roda em paralelo ao de vendas.
 - **Arquivamento (`*_carregados`)** só ocorre depois que as leituras terminam.
 - Cada task executa o script original via `runpy` (código de transformação inalterado).
 

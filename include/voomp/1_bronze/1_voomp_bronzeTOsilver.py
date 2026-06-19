@@ -20,6 +20,7 @@ def gerar_hash(texto):
 # Caminhos
 pasta_origem = 'source_voomp/voomp'
 pasta_destino_vendas = 'source_voomp/f_vendas'
+pasta_destino_projecao = 'source_voomp/f_projecao'
 
 # Listar blobs na pasta origem, evitando arquivos que começam com "+"
 blobs = bronze_client.list_blobs(name_starts_with=pasta_origem + '/')
@@ -36,7 +37,7 @@ for blob in blobs:
     downloader.readinto(blob_data)
     blob_data.seek(0)
     
-    for sheet_name in ["Exportação de vendas"]:
+    for sheet_name in ["Exportação de vendas"]:  #Adicione aqui a aba projecao quando voltar a funcionar
         try:
             pl_df = pl.read_excel(blob_data, sheet_name=sheet_name)
             print(f"  ➡️ Aba: {sheet_name}")
@@ -68,8 +69,13 @@ for blob in blobs:
             # Criar nome do arquivo: nome do arquivo original + "_" + nome da aba (sem espaços)
             nome_arquivo = f"{nome_base}_{sheet_name.replace(' ', '_')}.parquet"
 
-            # Pasta destino (apenas vendas)
-            destino_blob = f"{pasta_destino_vendas}/{nome_arquivo}"
+            # Definir pasta destino conforme a aba
+            if "Exportação" in sheet_name:
+                destino_blob = f"{pasta_destino_vendas}/{nome_arquivo}"
+            elif "Projeção" in sheet_name:
+                destino_blob = f"{pasta_destino_projecao}/{nome_arquivo}"
+            else:
+                destino_blob = f"{pasta_destino_vendas}/{nome_arquivo}"  # padrão
 
             # Converter para bytes
             parquet_buffer = io.BytesIO()

@@ -8,7 +8,7 @@ Dois ramos independentes correm em paralelo:
   - Vendas:    espera arquivo -> bronze->silver -> (4 dims + f_vendas em
                paralelo) -> arquiva o f_vendas na silver; em paralelo arquiva
                o xlsx de origem no bronze.
-  - Projetadas: espera arquivo -> bronze->silver -> silver->gold.
+  - Projeções: espera arquivo -> bronze->silver -> silver->gold.
 
 Disparo event-driven: WasbPrefixSensor aguarda arquivos chegarem no bronze.
 Para testes locais puramente manuais, pode-se trocar `schedule` por None.
@@ -124,7 +124,7 @@ with DAG(
         deferrable=True,
         poke_interval=600,
         timeout=60 * 60 * 23,
-        soft_fail=True,  # projetadas é opcional -> ausência pula o ramo
+        soft_fail=True,  # projeção é opcional -> ausência pula o ramo
     )
 
     # --- Ramo VENDAS ----------------------------------------------------- #
@@ -179,7 +179,7 @@ with DAG(
         retries=0,
     )
 
-    # --- Ramo PROJETADAS (paralelo) -------------------------------------- #
+    # --- Ramo PROJEÇÕES (paralelo) -------------------------------------- #
     projetadas_bronze_to_silver = voomp_task(
         "projetadas_bronze_to_silver",
         "1_bronze/00_projetadas_bronzeTosilver.py",
