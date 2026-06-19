@@ -1,0 +1,24 @@
+name: Deploy to Astronomer
+
+on:
+  push:
+    branches: [main]
+
+env:
+  # Token de API criado no Astro (Deployment ou Workspace API Token).
+  # Configure em: Settings > Secrets and variables > Actions > New repository secret
+  ASTRO_API_TOKEN: ${{ secrets.ASTRONOMER_API_TOKEN }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Deploy to Astronomer
+        uses: astronomer/deploy-action@v0.9.0
+        with:
+          # ID do Deployment (cluster datamartbi01). Configure como
+          # repository variable: Settings > Secrets and variables > Actions > Variables
+          deployment-id: ${{ vars.ASTRO_DEPLOYMENT_ID }}

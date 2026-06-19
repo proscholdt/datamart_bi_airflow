@@ -1,0 +1,20 @@
+# Segredos locais — NUNCA commitar (contém chaves de produção!)
+.env
+.env.local
+
+# Astro / Airflow local
+.astro/
+airflow_settings.yaml
+logs/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS / IDE
+.DS_Store
+.vscode/

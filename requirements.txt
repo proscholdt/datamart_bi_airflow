@@ -1,0 +1,12 @@
+# === Dependências do pipeline Voomp ===
+# Motor de transformação de dados
+polars==1.17.1
+# Acesso ao Azure Blob Storage
+azure-storage-blob==12.23.1
+# Engine de leitura de Excel usada por pl.read_excel(.xlsx) — calamine
+fastexcel==0.12.0
+# Carregamento de variáveis de ambiente (usado por include/voomp/voomp_config.py)
+python-dotenv==1.0.1
+# Provider Azure: WasbPrefixSensor + tipo de conexão "wasb"
+# (sem pin: resolve contra as constraints do Astro Runtime)
+apache-airflow-providers-microsoft-azure
