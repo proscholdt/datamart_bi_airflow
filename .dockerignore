@@ -1,0 +1,13 @@
+# Não copiar para dentro da imagem Docker (segredos e lixo de build)
+.astro
+.git
+.env
+.env.local
+airflow_settings.yaml
+__pycache__/
+*.pyc
+*.pyo
+logs/
+.venv/
+venv/
+.vscode/
