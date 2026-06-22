@@ -10,3 +10,5 @@ python-dotenv==1.0.1
 # Provider Azure: WasbPrefixSensor + tipo de conexão "wasb"
 # (sem pin: resolve contra as constraints do Astro Runtime)
 apache-airflow-providers-microsoft-azure
+# Cliente HTTP para a API do Facebook (data mart facebook)
+requests
