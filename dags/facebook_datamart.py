@@ -1,19 +1,18 @@
-"""DAG do data mart Facebook (medallion: bronze API → silver → gold).
+"""DAG do data mart Facebook (Meta) — medallion em Delta Lake.
 
-Espelha o padrão do voomp_datamart, mas o BRONZE puxa da API do Facebook
-(Graph API v19.0) em vez de esperar um arquivo. São 3 cadeias independentes
-e paralelas — campaign / adset / ad — cada uma:
+Por entidade (campaign / adset / ad), 3 cadeias paralelas:
+    ingest_api → raw_to_bronze → bronze_to_silver → silver_to_gold (fato + dim)
 
-    ingest(API) → bronze→silver → silver→gold → dimensão
-                       │                │
-                       └→ arquiva       └→ arquiva  (carregados, em paralelo)
+- ingest: extrai a janela [watermark(bronze) − lookback ~10d, D-1] da Graph API
+  (restatement da Meta: conversões/ROAS mudam retroativamente), valida in-task
+  (staging efêmero) e grava JSON na zona RAW (append-only, particionada por
+  ingestion_date). Sem stage container, sem pastas carregados.
+- raw→bronze e bronze→silver: tabelas Delta, MERGE por grão (data + id).
+- silver→gold: FATO `f_<ent>` (delete+append por janela, particionado por data)
+  + DIM `dim_<ent>` (MERGE por id, SCD-1).
 
-Carga de teste de 2 meses: setar FB_LOAD_START_DATE / FB_LOAD_END_DATE no
-ambiente (ex.: no .env local). Os scripts cargaDiaria usam esse intervalo;
-sem essas vars, fazem a carga incremental normal (última data + 1 → ontem).
-
-Agendamento: Seg-Sex ao meio-dia (BRT), igual ao voomp (mesma janela de
-hibernação do Deployment). Execução via runpy; exceções FALHAM a task.
+Backfill: setar FB_LOAD_START_DATE / FB_LOAD_END_DATE no ambiente.
+Agenda: Seg-Sex meio-dia (BRT). compact/vacuum ficam na DAG `maintenance_datamart`.
 """
 from __future__ import annotations
 
@@ -29,83 +28,72 @@ from airflow.providers.standard.operators.empty import EmptyOperator
 from airflow.providers.standard.operators.python import PythonOperator
 
 AIRFLOW_HOME = os.environ.get("AIRFLOW_HOME", "/usr/local/airflow")
-FB_ROOT = Path(AIRFLOW_HOME) / "include" / "facebook"
+INCLUDE_ROOT = Path(AIRFLOW_HOME) / "include"
+FB_ROOT = INCLUDE_ROOT / "facebook"
 
 
-def run_script(script_relpath: str) -> None:
-    """Executa um script de include/facebook como '__main__' (via runpy).
+def _ensure_path() -> None:
+    # include/ -> `from common.delta_io import ...`; include/facebook/ -> `import fb_*`.
+    for p in (str(INCLUDE_ROOT), str(FB_ROOT)):
+        if p not in sys.path:
+            sys.path.insert(0, p)
 
-    Coloca include/facebook no sys.path para os scripts poderem fazer
-    `from facebook_config import ...`. Qualquer exceção propaga e FALHA a task.
-    """
-    if str(FB_ROOT) not in sys.path:
-        sys.path.insert(0, str(FB_ROOT))
+
+def run_ingest(script_relpath: str) -> None:
+    """Roda um script de ingestão (cargaDiaria) como __main__ via runpy."""
+    _ensure_path()
     runpy.run_path(str(FB_ROOT / script_relpath), run_name="__main__")
 
 
-def fb_task(task_id: str, script_relpath: str, **kwargs) -> PythonOperator:
-    return PythonOperator(
-        task_id=task_id,
-        python_callable=run_script,
-        op_kwargs={"script_relpath": script_relpath},
-        **kwargs,
-    )
+def run_transform(func_name: str, entity: str) -> None:
+    """Chama fb_transforms.<func_name>(entity) (raw_to_bronze / bronze_to_silver / silver_to_gold)."""
+    _ensure_path()
+    import fb_transforms
+
+    getattr(fb_transforms, func_name)(entity)
 
 
-# Por entidade: ingest (API) → bronze→silver → silver→gold → dim, + arquivamentos.
+# entidade -> script de ingestão (API → RAW)
 ENTITIES = {
-    "camp": {
-        "ingest": "1_bronze/cargaDiaria/1_diaAdia_face_camp.py",
-        "b2s": "1_bronze/transformers/1_facebook_campaign_bronze_to_silver_parquet.py",
-        "move_b": "1_bronze/transformers/2_facebook_campaign_moveTOcarregados.py",
-        "s2g": "2_silver/1_facebook_campaing_silver_TO_gold.py",
-        "move_s": "2_silver/2_facebook_campaing_moveTOcarregados.py",
-        "dim": "3_gold/1_dim_camp.py",
-    },
-    "adset": {
-        "ingest": "1_bronze/cargaDiaria/2_diaAdia_face_adset.py",
-        "b2s": "1_bronze/transformers/3_facebook_adset_bronze_to_silver_parquet.py",
-        "move_b": "1_bronze/transformers/4_facebook_adset_moveTocarregados.py",
-        "s2g": "2_silver/3_facebook_adset_silver_to_gold.py",
-        "move_s": "2_silver/4_facebook_adset_moveTOcarregados.py",
-        "dim": "3_gold/2_dim_adset.py",
-    },
-    "ad": {
-        "ingest": "1_bronze/cargaDiaria/3_diaAdia_face_ad.py",
-        "b2s": "1_bronze/transformers/5_facebook_ad_bronze_to_silver_parquet.py",
-        "move_b": "1_bronze/transformers/6_facebook_ad_moveTOcarregados.py",
-        "s2g": "2_silver/5_facebook_ad_silver_to_gold.py",
-        "move_s": "2_silver/6_facebook_ad_moveTOcarregados.py",
-        "dim": "3_gold/3_dim_ad.py",
-    },
+    "camp": "1_bronze/cargaDiaria/1_diaAdia_face_camp.py",
+    "adset": "1_bronze/cargaDiaria/2_diaAdia_face_adset.py",
+    "ad": "1_bronze/cargaDiaria/3_diaAdia_face_ad.py",
 }
 
 
 with DAG(
     dag_id="facebook_datamart",
-    description="Data mart Facebook: API → bronze → silver → gold (Azure Blob + Polars)",
+    description="Data mart Facebook: API → raw → bronze → silver → gold (Delta Lake)",
     schedule="0 12 * * 1-5",  # Seg-Sex meio-dia (BRT)
     start_date=pendulum.datetime(2026, 1, 1, tz="America/Sao_Paulo"),
     catchup=False,
-    max_active_runs=1,  # tasks movem/deletam blobs: 2 runs simultâneos corromperiam
+    max_active_runs=1,  # MERGE/delete em Delta: 1 run por vez evita conflito de commit
     default_args={"retries": 1},
-    tags=["facebook", "medallion", "azure-blob"],
+    tags=["facebook", "meta", "delta", "medallion"],
 ) as dag:
 
     pipeline_done = EmptyOperator(task_id="pipeline_done")
 
-    for ent, s in ENTITIES.items():
-        ingest = fb_task(f"{ent}_ingest_api", s["ingest"])
-        bronze_to_silver = fb_task(f"{ent}_bronze_to_silver", s["b2s"])
-        # arquivamentos fazem download/copy→delete: NÃO idempotentes → sem retry
-        archive_bronze = fb_task(f"{ent}_archive_bronze", s["move_b"], retries=0)
-        silver_to_gold = fb_task(f"{ent}_silver_to_gold", s["s2g"])
-        archive_silver = fb_task(f"{ent}_archive_silver", s["move_s"], retries=0)
-        dim = fb_task(f"{ent}_dim", s["dim"])
+    for ent, ingest_script in ENTITIES.items():
+        ingest = PythonOperator(
+            task_id=f"{ent}_ingest_api",
+            python_callable=run_ingest,
+            op_kwargs={"script_relpath": ingest_script},
+        )
+        raw_to_bronze = PythonOperator(
+            task_id=f"{ent}_raw_to_bronze",
+            python_callable=run_transform,
+            op_kwargs={"func_name": "raw_to_bronze", "entity": ent},
+        )
+        bronze_to_silver = PythonOperator(
+            task_id=f"{ent}_bronze_to_silver",
+            python_callable=run_transform,
+            op_kwargs={"func_name": "bronze_to_silver", "entity": ent},
+        )
+        silver_to_gold = PythonOperator(
+            task_id=f"{ent}_silver_to_gold",
+            python_callable=run_transform,
+            op_kwargs={"func_name": "silver_to_gold", "entity": ent},
+        )
 
-        ingest >> bronze_to_silver
-        bronze_to_silver >> archive_bronze          # arquiva o JSON do bronze
-        bronze_to_silver >> silver_to_gold
-        silver_to_gold >> archive_silver            # arquiva o parquet do silver
-        silver_to_gold >> dim
-        [archive_bronze, archive_silver, dim] >> pipeline_done
+        ingest >> raw_to_bronze >> bronze_to_silver >> silver_to_gold >> pipeline_done

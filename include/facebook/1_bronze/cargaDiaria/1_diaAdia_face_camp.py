@@ -8,7 +8,8 @@ import json
 from datetime import datetime, timedelta
 from azure.storage.blob import ContentSettings
 
-from facebook_config import get_blob_service_client, get_container_client, BRONZE as CONTAINER_NAME
+from facebook_config import get_blob_service_client, get_container_client
+from fb_meta import api_window, write_raw, ingestion_date
 
 # ================================
 # Credenciais e configuração
@@ -16,38 +17,18 @@ from facebook_config import get_blob_service_client, get_container_client, BRONZ
 ACCESS_TOKEN = os.getenv("FB_ACCESS_TOKEN")
 AD_ACCOUNT_ID = os.getenv("FB_AD_ACCOUNT_ID")
 
-DEST_FOLDER = "source_facebook/facebook_camp"
-CARREGADOS_FOLDER = "source_facebook/facebook_camp_carregados"
+ENTITY = "camp"
 
 # ================================
-# Inicializa o Blob Service (container datamartbi*, auto-criado)
+# Inicializa o Blob Service (zona RAW datamartbiraw, auto-criada)
 # ================================
-get_container_client("bronze")  # garante que o container exista
+get_container_client("raw")  # destino da ingestão é a RAW (JSON append-only)
 blob_service_client = get_blob_service_client()
+ING_DATE = ingestion_date()
 
 # ================================
 # Funções auxiliares
 # ================================
-def get_latest_loaded_date():
-    container_client = blob_service_client.get_container_client(CONTAINER_NAME)
-    blobs = container_client.list_blobs(name_starts_with=CARREGADOS_FOLDER + "/")
-
-    datas = []
-    for blob in blobs:
-        nome = os.path.basename(blob.name)
-        if nome.startswith("campaigns_") and nome.endswith(".json"):
-            try:
-                data_str = nome.replace("campaigns_", "").replace(".json", "")
-                data = datetime.strptime(data_str, "%Y-%m-%d")
-                datas.append(data)
-            except:
-                continue
-
-    if not datas:
-        raise Exception("❌ Nenhum arquivo encontrado na pasta carregados.")
-
-    return max(datas)
-
 def fetch_facebook_campaigns_by_day(start_date, end_date, only_with_data=False):
     print("📅 Gerando arquivos por dia...")
 
@@ -136,16 +117,16 @@ def fetch_facebook_campaigns_direct(start_date, end_date, only_with_data=False, 
     if not export_filename:
         export_filename = f"campaigns_{start_date}.json"
 
-    blob_path = f"{DEST_FOLDER}/{export_filename}"
+    # Pula dias vazios: não grava arquivo "[]" na raw (a validação exige não-vazio).
+    if not data:
+        print(f"⏭️  {start_date}: sem dados — nada gravado na raw")
+        return data
 
-    blob_client = blob_service_client.get_blob_client(container=CONTAINER_NAME, blob=blob_path)
-    blob_client.upload_blob(
-        json.dumps(data, indent=2, ensure_ascii=False),
-        overwrite=True,
-        content_settings=ContentSettings(content_type='application/json')
-    )
+    # Validação (staging in-task): todo registro não-vazio deve ter o id da entidade.
+    if any("campaign_id" not in d for d in data):
+        raise Exception(f"❌ Validação: registro sem campaign_id em {start_date}")
 
-    print(f"📁 Exportado para Azure: {blob_path}")
+    write_raw(ENTITY, data, start_date, ING_DATE)
     return data
 
 def get_action_value(actions, action_type, as_float=False):
@@ -161,30 +142,11 @@ def get_action_value(actions, action_type, as_float=False):
 # 🔽 EXECUÇÃO
 # ======================================
 if __name__ == "__main__":
-    # Backfill por intervalo via env (ex.: carga de 2 meses). Se FB_LOAD_START_DATE
-    # e FB_LOAD_END_DATE estiverem setadas, usa esse intervalo; senão, incremental.
-    _start_env = os.getenv("FB_LOAD_START_DATE")
-    _end_env = os.getenv("FB_LOAD_END_DATE")
-
-    if _start_env and _end_env:
-        print(f"📅 Carga por intervalo (env): {_start_env} → {_end_env}")
-        fetch_facebook_campaigns_by_day(
-            start_date=_start_env,
-            end_date=_end_env,
-            only_with_data=True
-        )
-    else:
-        latest_loaded = get_latest_loaded_date()
-        ontem = datetime.now() - timedelta(days=1)
-
-        if latest_loaded.date() >= ontem.date():
-            print("🟡 Dados já atualizados até ontem. Nada a fazer.")
-        else:
-            start_date = (latest_loaded + timedelta(days=1)).strftime("%Y-%m-%d")
-            end_date = ontem.strftime("%Y-%m-%d")
-
-            fetch_facebook_campaigns_by_day(
-                start_date=start_date,
-                end_date=end_date,
-                only_with_data=True
-            )
+    # Janela = watermark(bronze) - lookback até D-1 (ou FB_LOAD_START/END p/ backfill).
+    start_date, end_date = api_window(ENTITY)
+    print(f"📅 Janela de ingestão (camp): {start_date} → {end_date}  [ingestion_date={ING_DATE}]")
+    fetch_facebook_campaigns_by_day(
+        start_date=start_date,
+        end_date=end_date,
+        only_with_data=True,
+    )

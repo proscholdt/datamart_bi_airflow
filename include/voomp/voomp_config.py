@@ -20,11 +20,15 @@ STORAGE_ACCOUNT_NAME = os.getenv("STORAGE_ACCOUNT_NAME")
 STORAGE_ACCOUNT_KEY = os.getenv("STORAGE_ACCOUNT_KEY")
 
 # Novos containers do data mart. Podem ser sobrescritos por variável de ambiente.
+# RAW (datamartbiraw): zona crua append-only (snapshot do Excel por ingestion_date).
+# STAGE segue como INBOX de chegada do Excel (onde o arquivo é dropado).
+RAW = os.getenv("VOOMP_CONTAINER_RAW", "datamartbiraw")
+STAGE = os.getenv("VOOMP_CONTAINER_STAGE", "datamartbistage")
 BRONZE = os.getenv("VOOMP_CONTAINER_BRONZE", "datamartbibronze")
 SILVER = os.getenv("VOOMP_CONTAINER_SILVER", "datamartbisilver")
 GOLD = os.getenv("VOOMP_CONTAINER_GOLD", "datamartbigold")
 
-CONTAINERS = {"bronze": BRONZE, "silver": SILVER, "gold": GOLD}
+CONTAINERS = {"raw": RAW, "stage": STAGE, "bronze": BRONZE, "silver": SILVER, "gold": GOLD}
 
 
 def get_blob_service_client() -> BlobServiceClient:

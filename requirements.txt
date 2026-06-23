@@ -1,7 +1,9 @@
 # === Dependências do pipeline Voomp ===
 # Motor de transformação de dados
 polars==1.17.1
-# Acesso ao Azure Blob Storage
+# Delta Lake (delta-rs, sem Spark): tabelas Delta bronze/silver/gold + MERGE/vacuum
+deltalake==0.24.0
+# Acesso ao Azure Blob Storage (raw JSON + leitura de Excel)
 azure-storage-blob==12.23.1
 # Engine de leitura de Excel usada por pl.read_excel(.xlsx) — calamine
 fastexcel==0.12.0

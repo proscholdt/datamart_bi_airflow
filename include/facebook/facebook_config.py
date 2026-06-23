@@ -20,11 +20,14 @@ STORAGE_ACCOUNT_NAME = os.getenv("STORAGE_ACCOUNT_NAME")
 STORAGE_ACCOUNT_KEY = os.getenv("STORAGE_ACCOUNT_KEY")
 
 # Containers do data mart (mesmos do voomp). Override por variável de ambiente.
+# RAW (datamartbiraw): zona crua JSON append-only, particionada por ingestion_date.
+RAW = os.getenv("FB_CONTAINER_RAW", "datamartbiraw")
+STAGE = os.getenv("FB_CONTAINER_STAGE", "datamartbistage")
 BRONZE = os.getenv("FB_CONTAINER_BRONZE", "datamartbibronze")
 SILVER = os.getenv("FB_CONTAINER_SILVER", "datamartbisilver")
 GOLD = os.getenv("FB_CONTAINER_GOLD", "datamartbigold")
 
-CONTAINERS = {"bronze": BRONZE, "silver": SILVER, "gold": GOLD}
+CONTAINERS = {"raw": RAW, "stage": STAGE, "bronze": BRONZE, "silver": SILVER, "gold": GOLD}
 
 
 def get_blob_service_client() -> BlobServiceClient:

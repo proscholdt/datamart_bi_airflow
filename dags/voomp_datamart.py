@@ -1,26 +1,20 @@
-"""DAG do data mart Voomp (arquitetura medallion: bronze -> silver -> gold).
+"""DAG do data mart Voomp — medallion em Delta Lake (overwrite snapshot).
 
-Substitui a orquestração antiga por subprocess (Orchestrator_master.py + os
-*_orchestrator_*.py) por um DAG do Airflow, com paralelismo, retries e logs
-por task. Cada task executa um dos scripts originais (verbatim) via runpy.
+Excel dropado na INBOX (stage) → ingest valida + copia p/ RAW (histórico por
+ingestion_date) → bronze (Delta overwrite) → silver (MD5 + regras) → gold
+(f_vendas + 4 dims). Ramo projeções opcional. SEM incremental/lookback: cada
+drop é um snapshot completo; histórico via versões Delta + partições raw.
 
-Dois ramos independentes correm em paralelo:
-  - Vendas:    espera arquivo -> bronze->silver -> (4 dims + f_vendas em
-               paralelo) -> arquiva o f_vendas na silver; em paralelo arquiva
-               o xlsx de origem no bronze.
-  - Projeções: espera arquivo -> bronze->silver -> silver->gold.
+    wait_voomp_files → ingest_vendas → bronze_vendas → silver_vendas
+                                                          ├→ gold_f_vendas
+                                                          └→ gold_dim_{afiliado,cliente,oferta,produto}
+    wait_projetadas_files → ingest_projetadas → bronze_projetadas → gold_projetadas   (opcional)
 
-Agendamento: Seg-Sex ao meio-dia (BRT), alinhado à janela de hibernação do
-Deployment. O WasbPrefixSensor faz uma checagem rápida do arquivo no bronze.
-
-Execução: Deployment com CeleryExecutor (Development + hibernação). O
-`executor_config` de pods abaixo só age sob KubernetesExecutor — é ignorado
-sem efeito pelo Celery/LocalExecutor, então fica pronto caso troque depois.
+Agenda: Seg-Sex meio-dia (BRT). compact/vacuum na DAG `maintenance_datamart`.
 """
 from __future__ import annotations
 
 import os
-import runpy
 import sys
 from pathlib import Path
 
@@ -31,176 +25,98 @@ from airflow.providers.standard.operators.empty import EmptyOperator
 from airflow.providers.standard.operators.python import PythonOperator
 from airflow.providers.microsoft.azure.sensors.wasb import WasbPrefixSensor
 from airflow.utils.trigger_rule import TriggerRule
-from kubernetes.client import models as k8s
 
 AIRFLOW_HOME = os.environ.get("AIRFLOW_HOME", "/usr/local/airflow")
-VOOMP_ROOT = Path(AIRFLOW_HOME) / "include" / "voomp"
+INCLUDE_ROOT = Path(AIRFLOW_HOME) / "include"
+VOOMP_ROOT = INCLUDE_ROOT / "voomp"
 
-# Container do bronze observado pelos sensores (mesmo default de voomp_config.py)
-BRONZE_CONTAINER = os.getenv("VOOMP_CONTAINER_BRONZE", "datamartbibronze")
+# Inbox de chegada do Excel (sensor observa aqui). Stage segue como drop zone.
+INBOX_CONTAINER = os.getenv("VOOMP_CONTAINER_STAGE", "datamartbistage")
 
 
-# --------------------------------------------------------------------------- #
-# Execução dos scripts originais
-# --------------------------------------------------------------------------- #
-def run_script(script_relpath: str) -> None:
-    """Executa um script de include/voomp como se fosse '__main__'.
+def _ensure_path() -> None:
+    for p in (str(INCLUDE_ROOT), str(VOOMP_ROOT)):
+        if p not in sys.path:
+            sys.path.insert(0, p)
 
-    Coloca include/voomp no sys.path para que os scripts possam fazer
-    `from voomp_config import ...`. Qualquer exceção propaga e FALHA a task
-    (os scripts foram ajustados para re-levantar erros).
+
+def run_transform(func_name: str, name: str | None = None) -> None:
+    """Chama voomp_transforms.<func_name>([name]).
+
+    Assinatura SEM **kwargs de propósito: com **kwargs o PythonOperator (Airflow 3)
+    injetaria o contexto inteiro (dag/ti/ds...) e repassaria às funções de transform,
+    que não aceitam esses argumentos.
     """
-    if str(VOOMP_ROOT) not in sys.path:
-        sys.path.insert(0, str(VOOMP_ROOT))
-    runpy.run_path(str(VOOMP_ROOT / script_relpath), run_name="__main__")
+    _ensure_path()
+    import voomp_transforms
 
-
-def k8s_pod(mem_request: str, mem_limit: str, cpu_request: str = "250m") -> dict:
-    """executor_config de pod para o KubernetesExecutor (ajuste ao volume real)."""
-    return {
-        "pod_override": k8s.V1Pod(
-            spec=k8s.V1PodSpec(
-                containers=[
-                    k8s.V1Container(
-                        name="base",
-                        resources=k8s.V1ResourceRequirements(
-                            requests={"memory": mem_request, "cpu": cpu_request},
-                            limits={"memory": mem_limit},
-                        ),
-                    )
-                ]
-            )
-        )
-    }
-
-
-# Polars carrega o dataset inteiro em memória (entrada + saída em BytesIO).
-MEM_DEFAULT = k8s_pod("512Mi", "2Gi")
-MEM_HEAVY = k8s_pod("1Gi", "4Gi")  # leitura de Excel + hash linha-a-linha / fato grande
-
-
-def voomp_task(task_id: str, script_relpath: str, executor_config=None, **kwargs) -> PythonOperator:
-    return PythonOperator(
-        task_id=task_id,
-        python_callable=run_script,
-        op_kwargs={"script_relpath": script_relpath},
-        executor_config=executor_config or MEM_DEFAULT,
-        **kwargs,
-    )
+    fn = getattr(voomp_transforms, func_name)
+    fn(name) if name is not None else fn()
 
 
 with DAG(
     dag_id="voomp_datamart",
-    description="Data mart Voomp: bronze -> silver -> gold (Azure Blob + Polars)",
-    # Roda Seg-Sex ao meio-dia (BRT), alinhado à janela acordada do Deployment
-    # (hibernação): o arquivo já chegou (1x/dia), o sensor confere e processa.
-    schedule="0 12 * * 1-5",
+    description="Data mart Voomp: Excel → raw → bronze → silver → gold (Delta Lake, overwrite)",
+    schedule="0 12 * * 1-5",  # Seg-Sex meio-dia (BRT)
     start_date=pendulum.datetime(2026, 1, 1, tz="America/Sao_Paulo"),
     catchup=False,
-    max_active_runs=1,  # tasks movem/deletam blobs: 2 runs simultâneos corromperiam o estado
+    max_active_runs=1,  # overwrite Delta: 1 run por vez
     default_args={"retries": 1},
-    tags=["voomp", "medallion", "azure-blob"],
+    tags=["voomp", "delta", "medallion", "azure-blob"],
 ) as dag:
 
-    # --- Sensores de entrada (event-driven) ------------------------------ #
-    # mode="reschedule": libera o worker entre os pokes; o soft_fail é respeitado
-    # no timeout (no Airflow 3 o soft_fail não funciona com deferrable=True).
+    def t(task_id: str, func: str, **op) -> PythonOperator:
+        return PythonOperator(
+            task_id=task_id,
+            python_callable=run_transform,
+            op_kwargs={"func_name": func, **op},
+        )
+
+    # --- Sensores: arquivo dropado na inbox (stage) -------------------- #
     wait_voomp_files = WasbPrefixSensor(
         task_id="wait_voomp_files",
-        container_name=BRONZE_CONTAINER,
+        container_name=INBOX_CONTAINER,
         prefix="source_voomp/voomp/",
         wasb_conn_id="wasb_default",
         mode="reschedule",
         poke_interval=120,
         timeout=60 * 30,
-        soft_fail=True,  # sem arquivo na janela -> pula o ramo (não falha o run)
+        soft_fail=True,  # sem Excel na janela -> dia ocioso (pula o ramo)
     )
-
     wait_projetadas_files = WasbPrefixSensor(
         task_id="wait_projetadas_files",
-        container_name=BRONZE_CONTAINER,
+        container_name=INBOX_CONTAINER,
         prefix="source_voomp/projetadas_voomp/",
         wasb_conn_id="wasb_default",
         mode="reschedule",
         poke_interval=120,
         timeout=60 * 30,
-        soft_fail=True,  # projeção é opcional -> ausência pula o ramo
+        soft_fail=True,  # projeção é opcional
     )
 
-    # --- Ramo VENDAS ----------------------------------------------------- #
-    bronze_voomp_to_silver = voomp_task(
-        "bronze_voomp_to_silver",
-        "1_bronze/1_voomp_bronzeTOsilver.py",
-        executor_config=MEM_HEAVY,
-    )
-
-    dim_afiliado = voomp_task(
-        "dim_afiliado_silver_to_gold",
-        "2_silver/1_TO_gold/1_dim_afiliado_silverTOgold.py",
-    )
-    dim_cliente = voomp_task(
-        "dim_cliente_silver_to_gold",
-        "2_silver/1_TO_gold/2_dim_cliente_silverTOgold.py",
-    )
-    dim_oferta = voomp_task(
-        "dim_oferta_silver_to_gold",
-        "2_silver/1_TO_gold/3_dim_oferta_silverTOgold.py",
-    )
-    dim_produto = voomp_task(
-        "dim_produto_silver_to_gold",
-        "2_silver/1_TO_gold/4_dim_produto_silverTOgold.py",
-    )
-    f_vendas_silver_to_gold = voomp_task(
-        "f_vendas_silver_to_gold",
-        "2_silver/1_TO_gold/6_f_vendas_silverTOgold.py",
-        executor_config=MEM_HEAVY,
-    )
-
-    silver_to_gold_tasks = [
-        dim_afiliado,
-        dim_cliente,
-        dim_oferta,
-        dim_produto,
-        f_vendas_silver_to_gold,
+    # --- Ramo VENDAS --------------------------------------------------- #
+    ingest_vendas = t("ingest_vendas", "ingest_vendas")
+    bronze_vendas = t("bronze_vendas", "bronze_vendas")
+    silver_vendas = t("silver_vendas", "silver_vendas")
+    gold_f_vendas = t("gold_f_vendas", "gold_f_vendas")
+    dims = [
+        t(f"gold_{n}", "gold_dim", name=n)
+        for n in ("dim_afiliado", "dim_cliente", "dim_oferta", "dim_produto")
     ]
 
-    # Arquiva o xlsx de origem no bronze (depois que o bronze->silver leu).
-    # download->upload->delete NÃO é idempotente -> sem retry.
-    archive_bronze_voomp = voomp_task(
-        "archive_bronze_voomp",
-        "1_bronze/2_voomp_TO_carregados.py",
-        retries=0,
-    )
+    # --- Ramo PROJEÇÕES (opcional) ------------------------------------ #
+    ingest_projetadas = t("ingest_projetadas", "ingest_projetadas")
+    bronze_projetadas = t("bronze_projetadas", "bronze_projetadas")
+    gold_projetadas = t("gold_projetadas", "gold_projetadas")
 
-    # Arquiva o f_vendas da silver SÓ depois que as 5 tasks acima o leram.
-    archive_silver_f_vendas = voomp_task(
-        "archive_silver_f_vendas",
-        "2_silver/2_TO_carregados/8_f_vendas_TO_carregados.py",
-        retries=0,
-    )
-
-    # --- Ramo PROJEÇÕES (paralelo) -------------------------------------- #
-    projetadas_bronze_to_silver = voomp_task(
-        "projetadas_bronze_to_silver",
-        "1_bronze/00_projetadas_bronzeTosilver.py",
-    )
-    projetadas_silver_to_gold = voomp_task(
-        "projetadas_silver_to_gold",
-        "2_silver/1_TO_gold/00_projetadas_silverTOgold.py",
-    )
-
-    # --- Nó final -------------------------------------------------------- #
     pipeline_done = EmptyOperator(
         task_id="pipeline_done",
         trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
     )
 
-    # --- Dependências ---------------------------------------------------- #
-    wait_voomp_files >> bronze_voomp_to_silver
-    bronze_voomp_to_silver >> silver_to_gold_tasks
-    bronze_voomp_to_silver >> archive_bronze_voomp
-    silver_to_gold_tasks >> archive_silver_f_vendas
+    # --- Dependências -------------------------------------------------- #
+    wait_voomp_files >> ingest_vendas >> bronze_vendas >> silver_vendas
+    silver_vendas >> gold_f_vendas >> pipeline_done
+    silver_vendas >> dims >> pipeline_done
 
-    wait_projetadas_files >> projetadas_bronze_to_silver >> projetadas_silver_to_gold
-
-    [archive_silver_f_vendas, archive_bronze_voomp, projetadas_silver_to_gold] >> pipeline_done
+    wait_projetadas_files >> ingest_projetadas >> bronze_projetadas >> gold_projetadas >> pipeline_done
