@@ -55,12 +55,21 @@ def _write_opts(partition_by):
 
 
 def _sanitize(df):
-    """Colunas 100% nulas viram dtype Null (não suportado pelo writer Delta).
+    """Ajustes p/ compatibilidade do Delta gerado:
 
-    Casta-as p/ Utf8 (Excel do voomp pode ter colunas inteiramente vazias).
+    1. Colunas 100% nulas (dtype Null, não suportado pelo writer Delta) → Utf8.
+    2. Datetime SEM timezone → marca como UTC (timestamp padrão). O delta-rs grava
+       datetime naive com o feature 'timestampNtz' (reader v3), que o Synapse
+       serverless NÃO lê (devolve 0 linhas). Marcar UTC mantém o valor de parede
+       e usa o timestamp padrão (reader v1), legível pelo Synapse.
     """
-    null_cols = [c for c, dt in df.schema.items() if dt == pl.Null]
-    return df.with_columns([pl.col(c).cast(pl.Utf8) for c in null_cols]) if null_cols else df
+    casts = []
+    for c, dt in df.schema.items():
+        if dt == pl.Null:
+            casts.append(pl.col(c).cast(pl.Utf8))
+        elif isinstance(dt, pl.Datetime) and dt.time_zone is None:
+            casts.append(pl.col(c).dt.replace_time_zone("UTC"))
+    return df.with_columns(casts) if casts else df
 
 
 def table_exists(uri, opts=None):
