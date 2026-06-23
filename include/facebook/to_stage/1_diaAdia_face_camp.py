@@ -9,7 +9,8 @@ from datetime import datetime, timedelta
 from azure.storage.blob import ContentSettings
 
 from facebook_config import get_blob_service_client, get_container_client
-from fb_meta import api_window, write_raw, ingestion_date
+from fb_meta import api_window
+from to_raw.raw_io import write_raw, ingestion_date
 
 # ================================
 # Credenciais e configuração

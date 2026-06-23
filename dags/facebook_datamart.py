@@ -45,19 +45,28 @@ def run_ingest(script_relpath: str) -> None:
     runpy.run_path(str(FB_ROOT / script_relpath), run_name="__main__")
 
 
+# func_name -> módulo do estágio (pastas to_bronze / to_silver / to_gold)
+_TRANSFORM_MODULES = {
+    "raw_to_bronze": "to_bronze.raw_to_bronze",
+    "bronze_to_silver": "to_silver.bronze_to_silver",
+    "silver_to_gold": "to_gold.silver_to_gold",
+}
+
+
 def run_transform(func_name: str, entity: str) -> None:
-    """Chama fb_transforms.<func_name>(entity) (raw_to_bronze / bronze_to_silver / silver_to_gold)."""
+    """Chama <modulo_do_estagio>.<func_name>(entity)."""
     _ensure_path()
-    import fb_transforms
+    import importlib
 
-    getattr(fb_transforms, func_name)(entity)
+    module = importlib.import_module(_TRANSFORM_MODULES[func_name])
+    getattr(module, func_name)(entity)
 
 
-# entidade -> script de ingestão (API → RAW)
+# entidade -> script de ingestão (API → staging → RAW), em to_stage/
 ENTITIES = {
-    "camp": "1_bronze/cargaDiaria/1_diaAdia_face_camp.py",
-    "adset": "1_bronze/cargaDiaria/2_diaAdia_face_adset.py",
-    "ad": "1_bronze/cargaDiaria/3_diaAdia_face_ad.py",
+    "camp": "to_stage/1_diaAdia_face_camp.py",
+    "adset": "to_stage/2_diaAdia_face_adset.py",
+    "ad": "to_stage/3_diaAdia_face_ad.py",
 }
 
 

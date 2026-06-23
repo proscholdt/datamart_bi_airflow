@@ -40,17 +40,29 @@ def _ensure_path() -> None:
             sys.path.insert(0, p)
 
 
+# func_name -> módulo do estágio (pastas to_stage / to_bronze / to_silver / to_gold)
+_FUNC_MODULES = {
+    "ingest_vendas": "to_stage.ingest",
+    "ingest_projetadas": "to_stage.ingest",
+    "bronze_vendas": "to_bronze.bronze",
+    "bronze_projetadas": "to_bronze.bronze",
+    "silver_vendas": "to_silver.silver",
+    "gold_f_vendas": "to_gold.gold",
+    "gold_dim": "to_gold.gold",
+    "gold_projetadas": "to_gold.gold",
+}
+
+
 def run_transform(func_name: str, name: str | None = None) -> None:
-    """Chama voomp_transforms.<func_name>([name]).
+    """Chama <modulo_do_estagio>.<func_name>([name]).
 
     Assinatura SEM **kwargs de propósito: com **kwargs o PythonOperator (Airflow 3)
-    injetaria o contexto inteiro (dag/ti/ds...) e repassaria às funções de transform,
-    que não aceitam esses argumentos.
+    injetaria o contexto inteiro (dag/ti/ds...) e repassaria às funções de transform.
     """
     _ensure_path()
-    import voomp_transforms
+    import importlib
 
-    fn = getattr(voomp_transforms, func_name)
+    fn = getattr(importlib.import_module(_FUNC_MODULES[func_name]), func_name)
     fn(name) if name is not None else fn()
 
 

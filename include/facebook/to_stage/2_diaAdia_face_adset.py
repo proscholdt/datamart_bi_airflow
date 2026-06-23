@@ -4,27 +4,22 @@ import requests
 import os
 import json
 from datetime import datetime, timedelta
-from dotenv import load_dotenv
-from azure.storage.blob import BlobServiceClient, ContentSettings
+from azure.storage.blob import ContentSettings
 
-load_dotenv()
+from facebook_config import get_blob_service_client, get_container_client
+from fb_meta import api_window
+from to_raw.raw_io import write_raw, ingestion_date
 
 # Facebook
 ACCESS_TOKEN = os.getenv("FB_ACCESS_TOKEN")
 AD_ACCOUNT_ID = os.getenv("FB_AD_ACCOUNT_ID")
 
-# Azure
-STORAGE_ACCOUNT_NAME = os.getenv("STORAGE_ACCOUNT_NAME")
-STORAGE_ACCOUNT_KEY = os.getenv("STORAGE_ACCOUNT_KEY")
-CONTAINER_NAME = "bronze"
-DEST_FOLDER = "source_facebook/facebook_adset"
-CARREGADOS_FOLDER = "source_facebook/facebook_adset_carregados"
+ENTITY = "adset"
 
-# Cliente Azure
-blob_service_client = BlobServiceClient(
-    account_url=f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net",
-    credential=STORAGE_ACCOUNT_KEY
-)
+# Zona RAW (datamartbiraw, auto-criada)
+get_container_client("raw")  # destino da ingestão é a RAW (JSON append-only)
+blob_service_client = get_blob_service_client()
+ING_DATE = ingestion_date()
 
 # ------------- NOVO: helpers para coletar públicos por Ad Set -------------
 def _api_get_paged(url: str, params: dict):
@@ -93,27 +88,6 @@ def build_adset_custom_audience_map():
         mapping[str(adset.get("id"))] = " | ".join(audiences) if audiences else ""
     return mapping
 # --------------------------------------------------------------------------
-
-# Função para obter a data mais recente da pasta carregada
-def get_latest_loaded_date():
-    container_client = blob_service_client.get_container_client(CONTAINER_NAME)
-    blobs = container_client.list_blobs(name_starts_with=CARREGADOS_FOLDER + "/")
-
-    datas = []
-    for blob in blobs:
-        nome = os.path.basename(blob.name)
-        if nome.startswith("adsets_") and nome.endswith(".json"):
-            try:
-                data_str = nome.replace("adsets_", "").replace(".json", "")
-                data = datetime.strptime(data_str, "%Y-%m-%d")
-                datas.append(data)
-            except:
-                continue
-
-    if not datas:
-        raise Exception("Nenhum arquivo encontrado na pasta carregados.")
-
-    return max(datas)
 
 # Função principal
 def fetch_facebook_adsets_by_day(start_date, end_date, only_with_data=False):
@@ -215,18 +189,16 @@ def fetch_facebook_adsets_direct(start_date, end_date, only_with_data=False, exp
     if not export_filename:
         export_filename = f"adsets_{start_date}.json"
 
-    json_str = json.dumps(data, indent=2, ensure_ascii=False)
+    # Pula dias vazios: não grava arquivo "[]" na raw (a validação exige não-vazio).
+    if not data:
+        print(f"⏭️  {start_date}: sem dados — nada gravado na raw")
+        return data
 
-    blob_path = f"{DEST_FOLDER}/{export_filename}"
-    blob_client = blob_service_client.get_blob_client(container=CONTAINER_NAME, blob=blob_path)
+    # Validação (staging in-task): todo registro não-vazio deve ter o id da entidade.
+    if any("adset_id" not in d for d in data):
+        raise Exception(f"❌ Validação: registro sem adset_id em {start_date}")
 
-    blob_client.upload_blob(
-        json_str.encode("utf-8"),
-        overwrite=True,
-        content_settings=ContentSettings(content_type="application/json")
-    )
-
-    print(f"Enviado para Azure: {blob_path}")
+    write_raw(ENTITY, data, start_date, ING_DATE)
     return data
 
 def get_action_value(actions, action_type, as_float=False):
@@ -240,18 +212,11 @@ def get_action_value(actions, action_type, as_float=False):
 
 # Execução
 if __name__ == "__main__":
-    latest_loaded = get_latest_loaded_date()
-    ontem = datetime.now() - timedelta(days=1)
-
-    if latest_loaded.date() >= ontem.date():
-        print("Dados já atualizados até ontem. Nada a fazer.")
-    else:
-        start_date = (latest_loaded + timedelta(days=1)).strftime("%Y-%m-%d")
-        end_date = ontem.strftime("%Y-%m-%d")
-
-        print(f"Dias a processar: {start_date} até {end_date}")
-        fetch_facebook_adsets_by_day(
-            start_date=start_date,
-            end_date=end_date,
-            only_with_data=True
-        )
+    # Janela = watermark(bronze) - lookback até D-1 (ou FB_LOAD_START/END p/ backfill).
+    start_date, end_date = api_window(ENTITY)
+    print(f"📅 Janela de ingestão (adset): {start_date} → {end_date}  [ingestion_date={ING_DATE}]")
+    fetch_facebook_adsets_by_day(
+        start_date=start_date,
+        end_date=end_date,
+        only_with_data=True,
+    )
