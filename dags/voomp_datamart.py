@@ -25,6 +25,7 @@ from airflow.providers.standard.operators.empty import EmptyOperator
 from airflow.providers.standard.operators.python import PythonOperator
 from airflow.providers.microsoft.azure.sensors.wasb import WasbPrefixSensor
 from airflow.utils.trigger_rule import TriggerRule
+from kubernetes.client import models as k8s
 
 AIRFLOW_HOME = os.environ.get("AIRFLOW_HOME", "/usr/local/airflow")
 INCLUDE_ROOT = Path(AIRFLOW_HOME) / "include"
@@ -66,6 +67,30 @@ def run_transform(func_name: str, name: str | None = None) -> None:
     fn(name) if name is not None else fn()
 
 
+# --- Recursos por task: SÓ valem sob KubernetesExecutor (request=MIN, limit=MAX).
+#     No Astro Executor / LocalExecutor são ignorados — ficam prontos p/ K8s.
+def k8s_pod(mem_request: str, mem_limit: str, cpu_request: str = "250m") -> dict:
+    return {
+        "pod_override": k8s.V1Pod(
+            spec=k8s.V1PodSpec(
+                containers=[
+                    k8s.V1Container(
+                        name="base",
+                        resources=k8s.V1ResourceRequirements(
+                            requests={"memory": mem_request, "cpu": cpu_request},
+                            limits={"memory": mem_limit},
+                        ),
+                    )
+                ]
+            )
+        )
+    }
+
+
+MEM_DEFAULT = k8s_pod("512Mi", "2Gi")   # min 512Mi / max 2Gi
+MEM_HEAVY = k8s_pod("1Gi", "4Gi")       # Excel + hash linha-a-linha / fato grande
+
+
 with DAG(
     dag_id="voomp_datamart",
     description="Data mart Voomp: Excel → raw → bronze → silver → gold (Delta Lake, overwrite)",
@@ -77,11 +102,12 @@ with DAG(
     tags=["voomp", "delta", "medallion", "azure-blob"],
 ) as dag:
 
-    def t(task_id: str, func: str, **op) -> PythonOperator:
+    def t(task_id: str, func: str, mem=None, **op) -> PythonOperator:
         return PythonOperator(
             task_id=task_id,
             python_callable=run_transform,
             op_kwargs={"func_name": func, **op},
+            executor_config=mem or MEM_DEFAULT,
         )
 
     # --- Sensores: arquivo dropado na inbox (stage) -------------------- #
@@ -108,9 +134,9 @@ with DAG(
 
     # --- Ramo VENDAS --------------------------------------------------- #
     ingest_vendas = t("ingest_vendas", "ingest_vendas")
-    bronze_vendas = t("bronze_vendas", "bronze_vendas")
-    silver_vendas = t("silver_vendas", "silver_vendas")
-    gold_f_vendas = t("gold_f_vendas", "gold_f_vendas")
+    bronze_vendas = t("bronze_vendas", "bronze_vendas", mem=MEM_HEAVY)  # lê o Excel
+    silver_vendas = t("silver_vendas", "silver_vendas", mem=MEM_HEAVY)  # MD5 linha-a-linha
+    gold_f_vendas = t("gold_f_vendas", "gold_f_vendas", mem=MEM_HEAVY)  # fato completo
     dims = [
         t(f"gold_{n}", "gold_dim", name=n)
         for n in ("dim_afiliado", "dim_cliente", "dim_oferta", "dim_produto")

@@ -26,6 +26,7 @@ import pendulum
 from airflow.models.dag import DAG
 from airflow.providers.standard.operators.empty import EmptyOperator
 from airflow.providers.standard.operators.python import PythonOperator
+from kubernetes.client import models as k8s
 
 AIRFLOW_HOME = os.environ.get("AIRFLOW_HOME", "/usr/local/airflow")
 INCLUDE_ROOT = Path(AIRFLOW_HOME) / "include"
@@ -62,6 +63,30 @@ def run_transform(func_name: str, entity: str) -> None:
     getattr(module, func_name)(entity)
 
 
+# --- Recursos por task: SÓ valem sob KubernetesExecutor (request=MIN, limit=MAX).
+#     No Astro Executor / LocalExecutor são ignorados — ficam prontos p/ K8s.
+def k8s_pod(mem_request: str, mem_limit: str, cpu_request: str = "250m") -> dict:
+    return {
+        "pod_override": k8s.V1Pod(
+            spec=k8s.V1PodSpec(
+                containers=[
+                    k8s.V1Container(
+                        name="base",
+                        resources=k8s.V1ResourceRequirements(
+                            requests={"memory": mem_request, "cpu": cpu_request},
+                            limits={"memory": mem_limit},
+                        ),
+                    )
+                ]
+            )
+        )
+    }
+
+
+MEM_DEFAULT = k8s_pod("512Mi", "2Gi")   # min 512Mi / max 2Gi
+MEM_HEAVY = k8s_pod("1Gi", "4Gi")       # ad: pull grande + resolução de criativo
+
+
 # entidade -> script de ingestão (API → staging → RAW), em to_stage/
 ENTITIES = {
     "camp": "to_stage/1_diaAdia_face_camp.py",
@@ -84,25 +109,30 @@ with DAG(
     pipeline_done = EmptyOperator(task_id="pipeline_done")
 
     for ent, ingest_script in ENTITIES.items():
+        mem = MEM_HEAVY if ent == "ad" else MEM_DEFAULT  # 'ad' é o mais pesado
         ingest = PythonOperator(
             task_id=f"{ent}_ingest_api",
             python_callable=run_ingest,
             op_kwargs={"script_relpath": ingest_script},
+            executor_config=mem,
         )
         raw_to_bronze = PythonOperator(
             task_id=f"{ent}_raw_to_bronze",
             python_callable=run_transform,
             op_kwargs={"func_name": "raw_to_bronze", "entity": ent},
+            executor_config=mem,
         )
         bronze_to_silver = PythonOperator(
             task_id=f"{ent}_bronze_to_silver",
             python_callable=run_transform,
             op_kwargs={"func_name": "bronze_to_silver", "entity": ent},
+            executor_config=mem,
         )
         silver_to_gold = PythonOperator(
             task_id=f"{ent}_silver_to_gold",
             python_callable=run_transform,
             op_kwargs={"func_name": "silver_to_gold", "entity": ent},
+            executor_config=mem,
         )
 
         ingest >> raw_to_bronze >> bronze_to_silver >> silver_to_gold >> pipeline_done
