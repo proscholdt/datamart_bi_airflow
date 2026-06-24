@@ -14,9 +14,13 @@ from to_raw.raw_io import write_raw, read_any, ingestion_date
 
 
 def _inbox_files(prefix, exts):
+    """Arquivos (não pastas) na inbox do stage. Marcadores de pasta (hdi_isfolder)
+    NUNCA entram na lista → a limpeza nunca apaga as pastas permanentes."""
     c = get_container_client("stage")
     out = []
-    for b in c.list_blobs(name_starts_with=prefix + "/"):
+    for b in c.list_blobs(name_starts_with=prefix + "/", include=["metadata"]):
+        if (b.metadata or {}).get("hdi_isfolder") == "true":
+            continue
         nome = os.path.basename(b.name)
         if nome.lower().endswith(exts) and not nome.startswith(("+", "~")):
             out.append(b.name)

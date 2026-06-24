@@ -8,7 +8,7 @@ from azure.storage.blob import ContentSettings
 
 from facebook_config import get_blob_service_client, get_container_client
 from fb_meta import api_window
-from to_raw.raw_io import write_raw, ingestion_date
+from to_stage.stage_io import write_stage
 
 # Facebook
 ACCESS_TOKEN = os.getenv("FB_ACCESS_TOKEN")
@@ -17,9 +17,8 @@ AD_ACCOUNT_ID = os.getenv("FB_AD_ACCOUNT_ID")
 ENTITY = "adset"
 
 # Zona RAW (datamartbiraw, auto-criada)
-get_container_client("raw")  # destino da ingestão é a RAW (JSON append-only)
+get_container_client("stage")  # destino da ingestão agora é o STAGE (zona de pouso)
 blob_service_client = get_blob_service_client()
-ING_DATE = ingestion_date()
 
 # ------------- NOVO: helpers para coletar públicos por Ad Set -------------
 def _api_get_paged(url: str, params: dict):
@@ -198,7 +197,7 @@ def fetch_facebook_adsets_direct(start_date, end_date, only_with_data=False, exp
     if any("adset_id" not in d for d in data):
         raise Exception(f"❌ Validação: registro sem adset_id em {start_date}")
 
-    write_raw(ENTITY, data, start_date, ING_DATE)
+    write_stage(ENTITY, data, start_date)
     return data
 
 def get_action_value(actions, action_type, as_float=False):
@@ -214,7 +213,7 @@ def get_action_value(actions, action_type, as_float=False):
 if __name__ == "__main__":
     # Janela = watermark(bronze) - lookback até D-1 (ou FB_LOAD_START/END p/ backfill).
     start_date, end_date = api_window(ENTITY)
-    print(f"📅 Janela de ingestão (adset): {start_date} → {end_date}  [ingestion_date={ING_DATE}]")
+    print(f"📅 Janela de ingestão (adset): {start_date} → {end_date}")
     fetch_facebook_adsets_by_day(
         start_date=start_date,
         end_date=end_date,

@@ -1,16 +1,16 @@
-"""Zona RAW do facebook — I/O (JSON append-only, particionado por ingestion_date).
+"""Zona RAW do facebook — promoção stage→raw + leitura da raw.
 
-write_raw: grava o JSON cru de um dia. read_raw_latest: lê a partição
-ingestion_date mais recente (a recém-gravada pela ingestão). Caminhos e nomes
-de arquivo vêm de fb_meta.ENTITIES.
+stage_to_raw: lê os JSON que o ingest gravou no STAGE, promove p/ a RAW
+(append-only, particionada por ingestion_date) e LIMPA o stage — apaga só os
+ARQUIVOS, preservando as pastas permanentes (hdi_isfolder).
+read_raw_latest: lê a partição ingestion_date mais recente p/ o bronze.
 """
 import json
 from datetime import date
 
 import polars as pl
-from azure.storage.blob import ContentSettings
 
-from facebook_config import RAW, get_blob_service_client
+from facebook_config import get_container_client
 from fb_meta import ENTITIES
 
 
@@ -18,37 +18,46 @@ def ingestion_date():
     return date.today().isoformat()
 
 
-def write_raw(entity, data_list, event_date, ing_date=None):
-    """Grava o JSON cru de UM dia na raw: <raw_dir>/ingestion_date=<X>/<stem>_<dia>.json."""
+def stage_to_raw(entity, ing_date=None):
+    """Promove os JSON do STAGE p/ a RAW (ingestion_date) e limpa o stage (só arquivos)."""
     cfg = ENTITIES[entity]
-    ing_date = ing_date or ingestion_date()
-    path = f"{cfg['raw_dir']}/ingestion_date={ing_date}/{cfg['stem']}_{event_date}.json"
-    blob = get_blob_service_client().get_blob_client(container=RAW, blob=path)
-    blob.upload_blob(
-        json.dumps(data_list, ensure_ascii=False, indent=2).encode("utf-8"),
-        overwrite=True,
-        content_settings=ContentSettings(content_type="application/json"),
-    )
-    print(f"📥 raw: {RAW}/{path} ({len(data_list)} registros)")
+    ing = ing_date or ingestion_date()
+    prefix = f"{cfg['raw_dir']}/"  # source_facebook/facebook_<entity>/
+    stage = get_container_client("stage")
+    raw = get_container_client("raw")
+
+    files = [
+        b for b in stage.list_blobs(name_starts_with=prefix, include=["metadata"])
+        if b.name.endswith(".json") and (b.metadata or {}).get("hdi_isfolder") != "true"
+    ]
+    for b in files:
+        data = stage.download_blob(b.name).readall()
+        fname = b.name.rsplit("/", 1)[-1]
+        raw.upload_blob(name=f"{cfg['raw_dir']}/ingestion_date={ing}/{fname}", data=data, overwrite=True)
+    # limpa o stage: apaga SÓ os arquivos; as pastas (hdi_isfolder) ficam permanentes.
+    for b in files:
+        stage.delete_blob(b.name)
+    print(f"⬆️ stage→raw {entity}: {len(files)} arquivo(s) promovidos; stage limpa (pastas preservadas)")
 
 
-def read_raw_latest(entity):
-    """DataFrame da partição ingestion_date MAIS RECENTE da raw (a recém-gravada)."""
+def read_raw_latest(entity, ing_date=None):
+    """DataFrame da partição ingestion_date DO RUN (default = hoje, a recém-promovida).
+
+    Lê SÓ `ingestion_date=<ing>/` (não enumera o histórico append-only da raw). Se o
+    stage veio vazio nessa janela, não há partição de hoje → DataFrame vazio (o
+    raw→bronze não muda nada), em vez de remesclar silenciosamente um dia anterior.
+    """
     cfg = ENTITIES[entity]
-    c = get_blob_service_client().get_container_client(RAW)
-    prefix = f"{cfg['raw_dir']}/"
-    parts = set()
-    for b in c.list_blobs(name_starts_with=prefix):
-        seg = b.name[len(prefix):].split("/")[0]
-        if seg.startswith("ingestion_date="):
-            parts.add(seg)
-    if not parts:
-        return pl.DataFrame()
-    latest = max(parts)
+    c = get_container_client("raw")
+    ing = ing_date or ingestion_date()
+    part_prefix = f"{cfg['raw_dir']}/ingestion_date={ing}/"
     recs = []
-    for b in c.list_blobs(name_starts_with=f"{prefix}{latest}/"):
+    for b in c.list_blobs(name_starts_with=part_prefix):
         if not b.name.endswith(".json"):
             continue
         recs.extend(json.loads(c.download_blob(b.name).readall()))
-    print(f"📤 raw lido: {cfg['raw_dir']}/{latest} ({len(recs)} registros)")
-    return pl.DataFrame(recs) if recs else pl.DataFrame()
+    if not recs:
+        print(f"📭 raw vazio: {part_prefix} (sem dados nesta janela; bronze não muda)")
+        return pl.DataFrame()
+    print(f"📤 raw lido: {part_prefix} ({len(recs)} registros)")
+    return pl.DataFrame(recs)
