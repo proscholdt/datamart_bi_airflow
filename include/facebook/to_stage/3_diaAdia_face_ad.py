@@ -1,416 +1,90 @@
+"""Ingestão facebook — AD (API Graph → STAGE).
 
+Insights nível ad com time_increment=1 (fatiado p/ evitar timeout) + resolução de
+criativo/vídeo EM LOTE (parâmetro `ids`, 1× por anúncio — não por dia). O método
+antigo resolvia o criativo por dia por anúncio (centenas/milhares de chamadas →
+rate limit no tier development_access); este faz ~dezenas. 1 JSON/dia no stage.
+Janela do api_window (incremental: watermark − lookback até D-1; ou FB_LOAD_* p/ backfill).
+"""
 import os
 import re
 import json
 import time
+import datetime as _dt
+
 import requests
-from datetime import datetime, timedelta
-from azure.storage.blob import ContentSettings
 
 from facebook_config import get_blob_service_client, get_container_client
 from fb_meta import api_window
 from to_stage.stage_io import write_stage
 
-# =========================
-# Configuração básica
-# =========================
-
-# Facebook
 ACCESS_TOKEN = os.getenv("FB_ACCESS_TOKEN")
 AD_ACCOUNT_ID = os.getenv("FB_AD_ACCOUNT_ID")
-
 ENTITY = "ad"
+G = "https://graph.facebook.com/v19.0"
 
-# Zona RAW (datamartbiraw, auto-criada)
-get_container_client("stage")  # destino da ingestão agora é o STAGE (zona de pouso)
+get_container_client("stage")
 blob_service_client = get_blob_service_client()
 
-# =========================
-# Utilidades de chamada ao Graph API
-# =========================
-def _api_get(url: str, params: dict, retries: int = 3, backoff: float = 1.5):
-    """
-    GET com tentativas simples e backoff para lidar com 5xx e limite de rate.
-    """
-    for i in range(retries):
-        r = requests.get(url, params=params)
+REQUIRED_FIELDS = [
+    "ad_id", "ad_name", "campaign_id", "adset_id", "date_start", "date_stop",
+    "spend", "impressions", "clicks", "ctr", "cpc", "reach", "frequency", "cost_per_unique_click", "actions",
+]
+DEFAULTS = {
+    "spend": 0.0, "impressions": 0, "clicks": 0, "ctr": 0.0, "cpc": 0.0, "reach": 0,
+    "frequency": 0.0, "cost_per_unique_click": 0.0, "leads": 0, "purchases": 0, "purchase_value": 0.0,
+    "video_url": "", "video_url_click": "", "video_thumbnail_url": "",
+}
+CREATIVE_FIELDS = "creative{effective_object_story_id,object_story_id,object_type,asset_feed_spec,object_story_spec}"
+
+
+def _get(url, params, tag=""):
+    """GET com retry: rate limit (code17) 90s; transitório/timeout (code2/100/5xx/429) 20s."""
+    for attempt in range(10):
+        try:
+            r = requests.get(url, params=params, timeout=180)
+        except requests.RequestException as e:
+            print(f"  [net {tag}] {type(e).__name__} 15s ({attempt+1})"); time.sleep(15); continue
         if r.status_code == 200:
             return r.json()
-        # Tratamento básico para rate limit / erros transitórios
-        if r.status_code in (429, 500, 502, 503, 504):
-            time.sleep(backoff * (i + 1))
-            continue
-        # Outros erros: falha direta
-        raise Exception(f"Erro API Facebook: {r.status_code} - {r.text}")
-    # Se esgotar tentativas
-    r.raise_for_status()
+        txt = r.text; low = txt.lower()
+        if '"code":17' in txt or "request limit" in low:
+            print(f"  [rate {tag}] 90s ({attempt+1})"); time.sleep(90); continue
+        if (r.status_code in (429, 500, 502, 503, 504) or '"code":2' in txt or '"code":100' in txt
+                or "temporarily unavailable" in low or "tente novamente" in low or "expirou" in low or "try again" in low):
+            print(f"  [transient {tag}] 20s ({attempt+1})"); time.sleep(20); continue
+        raise Exception(f"Erro API Facebook ({tag}): {r.status_code} - {txt[:300]}")
+    raise Exception(f"Falha persistente em {tag}")
 
-def _get_ad_creative(ad_id: str):
-    """
-    Busca o 'creative' do anúncio para localizar video_id ou object_story_id.
-    """
-    url = f"https://graph.facebook.com/v19.0/{ad_id}"
-    params = {
-        "access_token": ACCESS_TOKEN,
-        "fields": "creative{effective_object_story_id,object_story_id,object_type,asset_feed_spec,object_story_spec}"
-    }
-    data = _api_get(url, params)
-    return ((data or {}).get("creative") or {})
 
-def _get_video_meta(video_id: str):
-    """
-    Retorna dict com permalink_url e thumbnail para o video_id.
-    """
-    url = f"https://graph.facebook.com/v19.0/{video_id}"
-    params = {
-        "access_token": ACCESS_TOKEN,
-        "fields": "permalink_url,picture,thumbnails{uri}"
-    }
-    data = _api_get(url, params) or {}
-    thumb = data.get("picture", "")
-    thumbs = (data.get("thumbnails") or {}).get("data") or []
-    if not thumb and thumbs:
-        thumb = thumbs[0].get("uri", "")
-    return {
-        "permalink_url": data.get("permalink_url", "") or "",
-        "thumbnail": thumb or ""
-    }
+def _chunks(start, end, size=14):
+    a = _dt.date.fromisoformat(start); b = _dt.date.fromisoformat(end); out = []
+    while a <= b:
+        c = min(a + _dt.timedelta(days=size - 1), b)
+        out.append((a.isoformat(), c.isoformat())); a = c + _dt.timedelta(days=1)
+    return out
 
-def _get_posts_meta_batch(post_ids: list[str]) -> dict:
+
+def _batched(ids, fields, tag):
+    """GET /?ids=...&fields=... em lotes de 50 → dict[id]=obj.
+
+    Tolerante: _get já re-tenta rate limit/transitório; se um lote falhar por erro
+    PERMANENTE (ex.: posts exigem 'pages_read_engagement', code #10), segue sem
+    aqueles ids — o vídeo cai no fallback (URL construída do pageid_postid).
     """
-    Resolve vários pageid_postid em uma única chamada:
-    retorna dict[id] = {"permalink_url": ..., "thumbnail": ...}
-    """
-    if not post_ids:
-        return {}
-    # Remover duplicados e limitar fatias para evitar URLs muito grandes
-    unique_ids = list(dict.fromkeys(post_ids))
-    results = {}
-    chunk_size = 50  # tamanho de lote seguro
-    for i in range(0, len(unique_ids), chunk_size):
-        chunk = unique_ids[i:i+chunk_size]
-        url = "https://graph.facebook.com/v19.0"
-        params = {
-            "access_token": ACCESS_TOKEN,
-            "ids": ",".join(chunk),
-            "fields": "permalink_url,full_picture"
-        }
+    out = {}
+    ids = list(dict.fromkeys(ids))
+    for i in range(0, len(ids), 50):
         try:
-            data = _api_get(url, params) or {}
-            for pid in chunk:
-                d = data.get(pid) or {}
-                results[pid] = {
-                    "permalink_url": d.get("permalink_url", "") or "",
-                    "thumbnail": d.get("full_picture", "") or ""
-                }
-        except Exception:
-            # Em caso de falha no lote, marca todos como não resolvidos
-            for pid in chunk:
-                results[pid] = {"permalink_url": "", "thumbnail": ""}
-    return results
+            j = _get(G, {"access_token": ACCESS_TOKEN, "ids": ",".join(ids[i:i + 50]), "fields": fields}, f"{tag}[{i}]")
+            out.update(j)
+        except Exception as e:
+            print(f"  [skip {tag}] lote ignorado ({type(e).__name__}: {str(e)[:120]})")
+    return out
 
-# =========================
-# Normalização de URLs
-# =========================
-def _normalize_video_url(url: str) -> str:
-    """
-    Converte retornos relativos/IDs em URL absoluta clicável.
-    Trata também padrão pageid_postid (^\d+_\d+$).
-    """
-    if not url:
-        return ""
-
-    if url.startswith(("http://", "https://")):
-        return url
-
-    # /videos/<id> -> watch?v=<id>
-    m = re.search(r"/videos/(\d+)", url)
-    if m:
-        vid = m.group(1)
-        return f"https://www.facebook.com/watch/?v={vid}"
-
-    # Somente dígitos (video_id)
-    if url.isdigit():
-        return f"https://www.facebook.com/watch/?v={url}"
-
-    # pageid_postid
-    m2 = re.fullmatch(r"(\d+)_(\d+)", url)
-    if m2:
-        page_id, post_id = m2.groups()
-        return f"https://www.facebook.com/{page_id}/posts/{post_id}"
-
-    # relativo
-    if url.startswith("/"):
-        return "https://www.facebook.com" + url
-
-    return url
-
-def _to_click_url(url: str) -> str:
-    """
-    Melhor URL para clique: se houver /videos/<id>, força watch/?v=<id>.
-    Senão, retorna normalizada.
-    """
-    if not url:
-        return ""
-    m = re.search(r"/videos/(\d+)", url)
-    if m:
-        return f"https://www.facebook.com/watch/?v={m.group(1)}"
-    return _normalize_video_url(url)
-
-# =========================
-# Extração de metadados de vídeo/post
-# =========================
-def _extract_video_meta_from_creative(creative: dict):
-    """
-    Ordem:
-      1) object_story_spec.video_data.video_id -> meta de vídeo
-      2) asset_feed_spec.videos[].video_id -> meta de vídeo
-      3) effective_object_story_id / object_story_id -> devolver ID para
-         resolução posterior em lote (pageid_postid).
-    Retorna tuple:
-      (video_url, video_thumbnail, pending_post_id)
-    Onde:
-      - video_url já vem como permalink quando for video_id,
-        ou string vazia quando depender de post.
-      - pending_post_id: string 'pageid_postid' que precisa ser resolvida depois.
-    """
-    if not creative:
-        return "", "", None
-
-    # 1) video_data.video_id
-    oss = creative.get("object_story_spec") or {}
-    video_data = oss.get("video_data") or {}
-    vid = video_data.get("video_id")
-    if vid:
-        try:
-            vm = _get_video_meta(str(vid))
-            url = vm.get("permalink_url", "") or f"https://www.facebook.com/watch/?v={vid}"
-            return url, vm.get("thumbnail", ""), None
-        except Exception:
-            return f"https://www.facebook.com/watch/?v={vid}", "", None
-
-    # 2) asset_feed_spec.videos[]
-    afs = creative.get("asset_feed_spec") or {}
-    for v in (afs.get("videos") or []):
-        vid2 = v.get("video_id")
-        if vid2:
-            try:
-                vm2 = _get_video_meta(str(vid2))
-                url = vm2.get("permalink_url", "") or f"https://www.facebook.com/watch/?v={vid2}"
-                return url, vm2.get("thumbnail", ""), None
-            except Exception:
-                return f"https://www.facebook.com/watch/?v={vid2}", "", None
-
-    # 3) post fallback (effective/object_story_id ou object_story_id)
-    for key in ("effective_object_story_id", "object_story_id"):
-        pid = creative.get(key)
-        if pid:
-            return "", "", str(pid)
-
-    return "", "", None
-
-# =========================
-# Lógica de extração e envio
-# =========================
-def fetch_facebook_ads_by_day(start_date, end_date, only_with_data=False):
-    """
-    Itera dia a dia e grava um arquivo JSON por data.
-    """
-    print("Gerando arquivos por dia (Ads)...")
-
-    start = datetime.strptime(start_date, "%Y-%m-%d")
-    end = datetime.strptime(end_date, "%Y-%m-%d")
-    delta = timedelta(days=1)
-
-    while start <= end:
-        date_str = start.strftime("%Y-%m-%d")
-        print(f"Processando {date_str}...")
-
-        data = fetch_facebook_ads_direct(
-            start_date=date_str,
-            end_date=date_str,
-            only_with_data=only_with_data,
-            export_filename=f"ads_{date_str}.json"
-        )
-
-        print(f"{date_str}: {len(data)} registros")
-        start += delta
-
-def fetch_facebook_ads_direct(start_date, end_date, only_with_data=False, export_filename=None):
-    """
-    Consulta /insights em nível de anúncio, anexa métricas e
-    resolve URLs de vídeo/post.
-    """
-    required_fields = [
-        "ad_id", "ad_name", "campaign_id", "adset_id",
-        "date_start", "date_stop", "spend", "impressions", "clicks",
-        "ctr", "cpc", "reach", "frequency", "cost_per_unique_click",
-        "actions"
-    ]
-
-    url = f"https://graph.facebook.com/v19.0/{AD_ACCOUNT_ID}/insights"
-    params = {
-        "access_token": ACCESS_TOKEN,
-        "time_range": json.dumps({"since": start_date, "until": end_date}),
-        "level": "ad",
-        "fields": ",".join(required_fields),
-        "limit": 500
-    }
-
-    # Paginação
-    all_rows = []
-    while True:
-        resp = _api_get(url, params)
-        rows = resp.get("data", []) or []
-        all_rows.extend(rows)
-        paging = resp.get("paging", {})
-        next_url = (paging.get("next") or "")
-        if not next_url:
-            break
-        # Quando vem 'next', a melhor forma é seguir a URL completa
-        # e limpar params para evitar sobrescrever
-        url = next_url
-        params = {}
-
-    data = all_rows
-
-    # Cache por ad_id
-    ad_ids = {str(item.get("ad_id")) for item in data if item.get("ad_id")}
-    # Armazenam metadados resolvidos por ad_id
-    video_meta_cache = {}
-    # Post IDs pendentes para resolução em lote
-    pending_post_ids = set()
-
-    # 1) Descobrir creativos e coletar video_id ou post_id
-    for ad_id in ad_ids:
-        try:
-            creative = _get_ad_creative(ad_id)
-            url_found, thumb_found, pending_post = _extract_video_meta_from_creative(creative)
-
-            if pending_post:
-                pending_post_ids.add(pending_post)
-                video_meta_cache[ad_id] = {
-                    "video_url": "",           # preencheremos depois com permalink do post
-                    "video_url_click": "",
-                    "video_thumbnail_url": ""
-                }
-            else:
-                # Já veio resolvido por video_id
-                normalized = _normalize_video_url(url_found)
-                click_url = _to_click_url(normalized)
-                video_meta_cache[ad_id] = {
-                    "video_url": normalized,
-                    "video_url_click": click_url,
-                    "video_thumbnail_url": thumb_found or ""
-                }
-        except Exception:
-            video_meta_cache[ad_id] = {
-                "video_url": "",
-                "video_url_click": "",
-                "video_thumbnail_url": ""
-            }
-
-    # 2) Resolver posts pendentes em lote
-    if pending_post_ids:
-        post_meta_map = _get_posts_meta_batch(list(pending_post_ids))
-    else:
-        post_meta_map = {}
-
-    # 3) Enriquecer cada linha
-    for item in data:
-        actions = item.pop("actions", []) or []
-        item["leads"] = get_action_value(actions, "lead")
-        item["purchases"] = get_action_value(actions, "purchase")
-        item["purchase_value"] = get_action_value(actions, "omni_purchase", as_float=True)
-
-        aid = str(item.get("ad_id")) if item.get("ad_id") is not None else ""
-        meta = video_meta_cache.get(aid, {})
-
-        # Se ainda não houver video_url (caso de post), tente achar o post no creative
-        if not meta.get("video_url"):
-            try:
-                creative = _get_ad_creative(aid)
-                pid = None
-                for key in ("effective_object_story_id", "object_story_id"):
-                    if creative.get(key):
-                        pid = str(creative[key])
-                        break
-                if pid:
-                    pmeta = post_meta_map.get(pid, {"permalink_url": "", "thumbnail": ""})
-                    permalink = pmeta.get("permalink_url", "")
-                    thumb = pmeta.get("thumbnail", "")
-                    if not permalink:
-                        # Fallback para URL normalizada
-                        permalink = _normalize_video_url(pid)
-                    meta = {
-                        "video_url": permalink or "",
-                        "video_url_click": _to_click_url(permalink) if permalink else "",
-                        "video_thumbnail_url": thumb or ""
-                    }
-            except Exception:
-                pass
-
-        # Gravar nos campos finais
-        item["video_url"] = meta.get("video_url", "") or ""
-        item["video_url_click"] = meta.get("video_url_click", "") or ""
-        item["video_thumbnail_url"] = meta.get("video_thumbnail_url", "") or ""
-
-    # 4) Garantir campos padrão
-    campos_padrao = {
-        "date_start": start_date,
-        "date_stop": end_date,
-        "spend": 0.0,
-        "impressions": 0,
-        "clicks": 0,
-        "ctr": 0.0,
-        "cpc": 0.0,
-        "reach": 0,
-        "frequency": 0.0,
-        "cost_per_unique_click": 0.0,
-        "leads": 0,
-        "purchases": 0,
-        "purchase_value": 0.0,
-        "video_url": "",
-        "video_url_click": "",
-        "video_thumbnail_url": ""
-    }
-    for item in data:
-        for campo, valor_padrao in campos_padrao.items():
-            if campo not in item:
-                item[campo] = valor_padrao
-
-    # 5) Filtrar somente com dados (opcional)
-    if only_with_data:
-        data = [d for d in data if any([
-            float(d.get("spend", 0) or 0) > 0,
-            int(float(d.get("impressions", 0) or 0)) > 0,
-            int(float(d.get("clicks", 0) or 0)) > 0,
-            int(float(d.get("leads", 0) or 0)) > 0,
-            int(float(d.get("purchases", 0) or 0)) > 0,
-            float(d.get("purchase_value", 0) or 0) > 0
-        ])]
-
-    # 6) Upload para Azure
-    if not export_filename:
-        export_filename = f"ads_{start_date}.json"
-
-    # Pula dias vazios: não grava arquivo "[]" na raw (a validação exige não-vazio).
-    if not data:
-        print(f"⏭️  {start_date}: sem dados — nada gravado na raw")
-        return data
-
-    # Validação (staging in-task): todo registro não-vazio deve ter o id da entidade.
-    if any("ad_id" not in d for d in data):
-        raise Exception(f"❌ Validação: registro sem ad_id em {start_date}")
-
-    write_stage(ENTITY, data, start_date)
-    return data
 
 def get_action_value(actions, action_type, as_float=False):
-    """
-    Lê valor de 'actions' tratando string/float/int.
-    """
-    for action in actions:
+    for action in actions or []:
         if action.get("action_type") == action_type:
             try:
                 val = action.get("value", 0)
@@ -419,16 +93,160 @@ def get_action_value(actions, action_type, as_float=False):
                 return 0.0 if as_float else 0
     return 0.0 if as_float else 0
 
-# =========================
-# Execução
-# =========================
+
+# --- normalização de URL de vídeo/post (idêntica ao método antigo) ---------- #
+def _normalize_video_url(url):
+    if not url:
+        return ""
+    if url.startswith(("http://", "https://")):
+        return url
+    m = re.search(r"/videos/(\d+)", url)
+    if m:
+        return f"https://www.facebook.com/watch/?v={m.group(1)}"
+    if url.isdigit():
+        return f"https://www.facebook.com/watch/?v={url}"
+    m2 = re.fullmatch(r"(\d+)_(\d+)", url)
+    if m2:
+        return f"https://www.facebook.com/{m2.group(1)}/posts/{m2.group(2)}"
+    if url.startswith("/"):
+        return "https://www.facebook.com" + url
+    return url
+
+
+def _to_click_url(url):
+    if not url:
+        return ""
+    m = re.search(r"/videos/(\d+)", url)
+    if m:
+        return f"https://www.facebook.com/watch/?v={m.group(1)}"
+    return _normalize_video_url(url)
+
+
+def _pick_video_id(cr):
+    vid = ((cr.get("object_story_spec") or {}).get("video_data") or {}).get("video_id")
+    if vid:
+        return str(vid)
+    for v in ((cr.get("asset_feed_spec") or {}).get("videos") or []):
+        if v.get("video_id"):
+            return str(v["video_id"])
+    return None
+
+
+def _pick_post_id(cr):
+    for k in ("effective_object_story_id", "object_story_id"):
+        if cr.get(k):
+            return str(cr[k])
+    return None
+
+
+def _video_thumb(d):
+    t = d.get("picture", "") or ""
+    if not t:
+        ths = (d.get("thumbnails") or {}).get("data") or []
+        if ths:
+            t = ths[0].get("uri", "") or ""
+    return t
+
+
+def _resolve_video(cr, video_meta, post_meta):
+    """(video_url, video_url_click, video_thumbnail_url) — vídeo primeiro, senão post."""
+    if not cr:
+        return "", "", ""
+    vid = _pick_video_id(cr)
+    if vid:
+        vm = video_meta.get(vid, {})
+        url = vm.get("permalink_url", "") or f"https://www.facebook.com/watch/?v={vid}"
+        nurl = _normalize_video_url(url)
+        return nurl, _to_click_url(nurl), vm.get("thumbnail", "")
+    pid = _pick_post_id(cr)
+    if pid:
+        pm = post_meta.get(pid, {})
+        permalink = pm.get("permalink_url", "") or _normalize_video_url(pid)
+        return permalink or "", (_to_click_url(permalink) if permalink else ""), pm.get("thumbnail", "") or ""
+    return "", "", ""
+
+
+def _resolve_video_map(ad_ids):
+    """ad_id -> (video_url, click, thumbnail), resolvendo criativo/vídeo/post em lote."""
+    creatives_raw = _batched(ad_ids, CREATIVE_FIELDS, "creative")
+    creative_by_ad = {aid: (creatives_raw.get(aid, {}) or {}).get("creative") or {} for aid in ad_ids}
+
+    vid_ids, post_ids = [], []
+    for cr in creative_by_ad.values():
+        v = _pick_video_id(cr)
+        if v:
+            vid_ids.append(v)
+        else:
+            pid = _pick_post_id(cr)
+            if pid:
+                post_ids.append(pid)
+
+    vmeta_raw = _batched(vid_ids, "permalink_url,picture,thumbnails{uri}", "video") if vid_ids else {}
+    video_meta = {vid: {"permalink_url": d.get("permalink_url", "") or "", "thumbnail": _video_thumb(d)}
+                  for vid, d in vmeta_raw.items()}
+    pmeta_raw = _batched(post_ids, "permalink_url,full_picture", "post") if post_ids else {}
+    post_meta = {pid: {"permalink_url": d.get("permalink_url", "") or "", "thumbnail": d.get("full_picture", "") or ""}
+                 for pid, d in pmeta_raw.items()}
+
+    return {aid: _resolve_video(cr, video_meta, post_meta) for aid, cr in creative_by_ad.items()}
+
+
+def fetch_facebook_ads_by_day(start_date, end_date, only_with_data=False):
+    # 1) insights (fatiado p/ não estourar timeout)
+    rows = []
+    for cs, ce in _chunks(start_date, end_date):
+        u = f"{G}/{AD_ACCOUNT_ID}/insights"
+        p = {"access_token": ACCESS_TOKEN, "time_range": json.dumps({"since": cs, "until": ce}),
+             "time_increment": 1, "level": "ad", "fields": ",".join(REQUIRED_FIELDS), "limit": 500}
+        while True:
+            j = _get(u, p, f"insights[{cs}]"); rows += j.get("data", [])
+            nxt = j.get("paging", {}).get("next")
+            if not nxt:
+                break
+            u, p = nxt, {}
+    print(f"insights ad: {len(rows)} linhas ({start_date}→{end_date})")
+
+    # 2) resolução de vídeo 1× por anúncio (em lote)
+    uniq = sorted({str(r["ad_id"]) for r in rows if r.get("ad_id")})
+    vmap = _resolve_video_map(uniq) if uniq else {}
+    print(f"video_url resolvido: {sum(1 for x in vmap.values() if x[0])}/{len(uniq)}")
+
+    # 3) agrupa por dia, processa (mesmo formato) e grava no stage
+    by_day = {}
+    for it in rows:
+        by_day.setdefault(it.get("date_start"), []).append(it)
+
+    for date_str in sorted(by_day):
+        items = by_day[date_str]
+        for item in items:
+            actions = item.pop("actions", []) or []
+            item["leads"] = get_action_value(actions, "lead")
+            item["purchases"] = get_action_value(actions, "purchase")
+            item["purchase_value"] = get_action_value(actions, "omni_purchase", as_float=True)
+            vu, vc, vt = vmap.get(str(item.get("ad_id")), ("", "", ""))
+            item["video_url"] = vu
+            item["video_url_click"] = vc
+            item["video_thumbnail_url"] = vt
+            for campo, val in DEFAULTS.items():
+                if campo not in item:
+                    item[campo] = val
+        data = items
+        if only_with_data:
+            data = [d for d in data if any([
+                float(d.get("spend", 0) or 0) > 0, int(float(d.get("impressions", 0) or 0)) > 0,
+                int(float(d.get("clicks", 0) or 0)) > 0, int(float(d.get("leads", 0) or 0)) > 0,
+                int(float(d.get("purchases", 0) or 0)) > 0, float(d.get("purchase_value", 0) or 0) > 0,
+            ])]
+        if not data:
+            print(f"⏭️  {date_str}: sem dados")
+            continue
+        if any("ad_id" not in d for d in data):
+            raise Exception(f"❌ Validação: registro sem ad_id em {date_str}")
+        write_stage(ENTITY, data, date_str)
+        print(f"{date_str}: {len(data)} registros")
+
+
 if __name__ == "__main__":
-    # Janela = watermark(bronze) - lookback até D-1 (ou FB_LOAD_START/END p/ backfill).
     start_date, end_date = api_window(ENTITY)
     print(f"📅 Janela de ingestão (ad): {start_date} → {end_date}")
-    fetch_facebook_ads_by_day(
-        start_date=start_date,
-        end_date=end_date,
-        only_with_data=True,
-    )
-
+    fetch_facebook_ads_by_day(start_date, end_date, only_with_data=True)
