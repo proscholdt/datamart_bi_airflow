@@ -47,6 +47,18 @@ TABLES += [
     (GOLD, "voomp/dim_produto"),
     (GOLD, "voomp/projetadas"),
 ]
+TABLES += [
+    (BRONZE, "hotmart/bronze_sales"),
+    (SILVER, "hotmart/silver_sales"),
+    (GOLD, "hotmart/f_vendas"),
+    (GOLD, "hotmart/dim_cliente"),
+    (GOLD, "hotmart/dim_produto"),
+    (GOLD, "hotmart/dim_oferta"),
+    (GOLD, "hotmart/dim_produtor"),
+    (BRONZE, "hotmart/bronze_subscriptions"),
+    (SILVER, "hotmart/silver_subscriptions"),
+    (GOLD, "hotmart/f_assinaturas"),
+]
 
 
 def run_maintain(container: str, path: str) -> None:

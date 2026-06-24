@@ -18,3 +18,5 @@ venv/
 # OS / IDE
 .DS_Store
 .vscode/
+hotmart_sample.json
+hotmart_subscriptions_sample.json
