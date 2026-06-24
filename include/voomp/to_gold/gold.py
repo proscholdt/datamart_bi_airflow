@@ -23,12 +23,24 @@ def _mes_ano_para_data(mes_ano):
     return f"01/{mes_num}/{ano}" if mes_num else None
 
 
+# Colunas de data/hora que viram DATE (só data) no fato. A data de parede já é a
+# do Brasil (rótulo UTC mantém o relógio), então o cast pega o dia correto.
+F_VENDAS_DATE_COLS = ["Data da venda", "Data de pagamento", "Data liberação do saldo"]
+
+
 def gold_f_vendas():
-    """silver → seleção das colunas do fato (grão ID Venda) → f_vendas Delta (overwrite)."""
+    """silver → seleção das colunas do fato (grão ID Venda) → f_vendas Delta (overwrite).
+
+    As colunas de data/hora (venda, pagamento, liberação) são reduzidas a DATE
+    (sem hora), consistente com 'Data de vencimento do boleto' que já é DATE.
+    """
     df = pl.read_delta(silver_vendas_uri(), storage_options=storage_options())
     cols = [c for c in F_VENDAS_COLS if c in df.columns]
-    overwrite_delta(df.select(cols), f_vendas_uri())
-    print(f"✅ f_vendas: {df.height} linhas, {len(cols)} colunas")
+    out = df.select(cols).with_columns(
+        [pl.col(c).cast(pl.Date) for c in F_VENDAS_DATE_COLS if c in cols]
+    )
+    overwrite_delta(out, f_vendas_uri())
+    print(f"✅ f_vendas: {out.height} linhas, {len(cols)} colunas (datas → DATE)")
 
 
 def gold_dim(name):

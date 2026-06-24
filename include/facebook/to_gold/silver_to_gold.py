@@ -1,5 +1,9 @@
-"""silver → gold (facebook): FATO (delete+append por janela, particionado por data)
-+ DIM (MERGE por id, SCD-1)."""
+"""silver → gold (facebook): FATO (delete+append por janela) + DIM (MERGE por id, SCD-1).
+
+O fato NÃO é particionado por `data`: o delete da janela já é por predicado
+(`data >= start`), e manter `data` como coluna física (não de partição) é o que
+o Synapse serverless consegue ler — coluna de partição Delta vem NULL no Synapse.
+"""
 from common.delta_io import scan_window, window_start, delete_and_append, merge_delta
 from fb_meta import (
     ENTITIES,
@@ -28,7 +32,7 @@ def silver_to_gold(entity):
         sdf.select([c for c in fact_cols if c in sdf.columns])
         .unique(subset=cfg["grain"], keep="last")
     )
-    delete_and_append(fact, fact_uri(entity), f"data >= '{fstart}'", partition_by=["data"])
+    delete_and_append(fact, fact_uri(entity), f"data >= '{fstart}'")
     print(f"✅ f_{entity}: {fact.height} linhas (janela >= {fstart})")
 
     # --- DIMENSÃO (SCD-1 por id): MERGE (atualiza atributos, insere novos) ---
