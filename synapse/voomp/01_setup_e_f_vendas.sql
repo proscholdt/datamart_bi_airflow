@@ -18,34 +18,36 @@
 USE biitvalleyschool;
 GO
 
--- 1) Data source para o container datamartbigold (onde está o Delta novo).
-IF EXISTS (SELECT 1 FROM sys.external_data_sources WHERE name = 'AzureDataLakeStore_DataMartBI_Gold')
-    DROP EXTERNAL DATA SOURCE [AzureDataLakeStore_DataMartBI_Gold];
-GO
-CREATE EXTERNAL DATA SOURCE [AzureDataLakeStore_DataMartBI_Gold]
-WITH (
-    LOCATION   = 'abfss://datamartbigold@saactivecampaign.dfs.core.windows.net/',
-    CREDENTIAL = [Service_Principal_2025_2027]
-);
+-- 1) Tabela externa: dropar PRIMEIRO (ela depende do data source). Sem isto, o
+--    DROP do data source falha com "used by an external table".
+IF OBJECT_ID('gold.Voomp_F_Vendas_airflow') IS NOT NULL
+    DROP EXTERNAL TABLE [gold].[Voomp_F_Vendas_airflow];
 GO
 
--- 2) File format DELTA (você só tinha ParquetFormat). Reutilizável p/ as 6 tabelas.
+-- 2) Data source p/ o container datamartbigold. IDEMPOTENTE: cria só se não existir
+--    e NÃO dropa (outras tabelas externas da gold podem compartilhar este data source).
+IF NOT EXISTS (SELECT 1 FROM sys.external_data_sources WHERE name = 'AzureDataLakeStore_DataMartBI_Gold')
+    CREATE EXTERNAL DATA SOURCE [AzureDataLakeStore_DataMartBI_Gold]
+    WITH (
+        LOCATION   = 'abfss://datamartbigold@saactivecampaign.dfs.core.windows.net/',
+        CREDENTIAL = [Service_Principal_2025_2027]
+    );
+GO
+
+-- 3) File format DELTA (você só tinha ParquetFormat). Reutilizável p/ as 6 tabelas.
 IF NOT EXISTS (SELECT 1 FROM sys.external_file_formats WHERE name = 'DeltaFormat')
     CREATE EXTERNAL FILE FORMAT [DeltaFormat] WITH (FORMAT_TYPE = DELTA);
 GO
 
--- 3) Tabela externa. Mantém [gold].[Voomp_F_Vendas], mas REAPONTA para o Delta
---    novo (datamartbigold/voomp/f_vendas). Tipos espelham o schema real do Delta.
-IF OBJECT_ID('gold.Voomp_F_Vendas') IS NOT NULL
-    DROP EXTERNAL TABLE [gold].[Voomp_F_Vendas];
-GO
-CREATE EXTERNAL TABLE [gold].[Voomp_F_Vendas]
+-- 4) (Re)cria a tabela externa [gold].[Voomp_F_Vendas_airflow] apontando p/ o Delta novo
+--    (datamartbigold/voomp/f_vendas). Tipos espelham o schema real do Delta.
+CREATE EXTERNAL TABLE [gold].[Voomp_F_Vendas_airflow]
 (
     [ID Venda]                       BIGINT,        -- Int64  (era INT)
-    [Data da venda]                  DATETIME2(6),  -- timestamp us (era DATETIME)
-    [Data de pagamento]              DATETIME2(6),
+    [Data da venda]                  DATE,          -- DATE (datetime reduzido a dia)
+    [Data de pagamento]              DATE,
     [Data de vencimento do boleto]   DATE,
-    [Data liberação do saldo]        DATETIME2(6),
+    [Data liberação do saldo]        DATE,
     [ID Produto]                     BIGINT,        -- Int64
     [ID Oferta]                      VARCHAR(4000),
     [Método de pagamento]            VARCHAR(4000),
@@ -87,7 +89,7 @@ WITH (
 );
 GO
 
--- 4) Teste.
-SELECT COUNT(*) AS linhas FROM [gold].[Voomp_F_Vendas];   -- esperado: 1174
-SELECT TOP 50 * FROM [gold].[Voomp_F_Vendas];
+-- 5) Teste.
+SELECT COUNT(*) AS linhas FROM [gold].[Voomp_F_Vendas_airflow];   -- esperado: 1174
+SELECT TOP 50 * FROM [gold].[Voomp_F_Vendas_airflow];
 GO
